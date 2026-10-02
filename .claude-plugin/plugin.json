@@ -1,0 +1,11 @@
+{
+  "name": "emacs-query",
+  "description": "Answer Emacs and Emacs Lisp questions by asking Emacs itself instead of grepping the config.",
+  "author": {
+    "name": "George Sotirchos"
+  },
+  "homepage": "https://github.com/gsotirchos/emacs-query",
+  "repository": "https://github.com/gsotirchos/emacs-query",
+  "license": "MIT",
+  "keywords": ["emacs", "elisp", "introspection", "documentation"]
+}

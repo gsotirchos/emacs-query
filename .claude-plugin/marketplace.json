@@ -1,0 +1,17 @@
+{
+  "name": "gsotirchos-emacs-query",
+  "owner": {
+    "name": "George Sotirchos"
+  },
+  "description": "Core-Emacs introspection for coding agents",
+  "metadata": {
+    "description": "Core-Emacs introspection for coding agents",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "emacs-query",
+      "source": "./"
+    }
+  ]
+}

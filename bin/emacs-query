@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly socket_name="emacs-query"
+readonly default_timeout=60
+readonly config_timeout=180
+
+subcommand=""
+payload=""
+opt_config=""
+opt_mode=""
+opt_manual=""
+opt_apropos=""
+opt_limit="40"
+opt_timeout=""
+opt_init_dir="${EMACS_QUERY_INIT_DIR:-${HOME}/.emacs.d}"
+
+usage() {
+    cat << 'EOF'
+Usage: emacs-query [OPTION]... <subcommand> <argument>
+
+Answers questions about Emacs, Emacs Lisp and your configuration by asking
+Emacs itself, instead of grepping the configuration tree.  Each query runs a
+throwaway batch Emacs; your own running Emacs is never contacted.
+
+Subcommands:
+  describe SYMBOL     Kind, signature, value, obsolescence, file:line, docstring.
+  apropos REGEXP      Functions, variables and faces matching REGEXP, with docs.
+  keys KEY|COMMAND    Command bound to a key sequence, or keys running a command.
+  info QUERY          Elisp/Emacs manual node for a symbol.
+  library NAME        Path, headers and commentary of a library.
+  macroexpand SEXP    Pretty-printed macroexpand-all.  Use it on use-package forms.
+  eval SEXP           Evaluate SEXP and pretty-print the result.
+  daemon start|stop|status
+                      Keep one Emacs alive so queries skip the bootstrap.
+
+Any <argument> may be `-' to read it from stdin, which sidesteps shell quoting
+for multi-line forms:
+
+  echo '(use-package foo :defer t)' | emacs-query macroexpand -
+
+Options:
+  --config            Load init.el too, for configured values, hook contents
+                      and keybindings.  Package installation, recompilation and
+                      network access are disabled.  Implied by `keys'.
+  --no-config         Force the fast tier, which never loads init.el.
+  --mode MODE         Resolve `keys' inside major mode MODE, e.g. --mode org-mode.
+  --manual NAME       Restrict `info' index matches to manual NAME.
+  --apropos           Also search every manual index in `info' (slow).
+  --limit N           Cap matches per section (default 40).
+  --timeout SECONDS   Give up after SECONDS (default 60, 180 with --config).
+  --init-dir DIR      Emacs configuration directory (default ~/.emacs.d).
+  -h, --help          This reference.
+      --version       Print the version.
+
+A daemon started with `daemon start' outlives this shell; stop it when done.
+EOF
+}
+
+die() {
+    echo "emacs-query: $*" >&2
+    exit 2
+}
+
+lisp_file() {
+    local source="${BASH_SOURCE[0]}" dir
+    while [[ -L "${source}" ]]; do
+        dir="$(cd -P "$(dirname "${source}")" && pwd)"
+        source="$(readlink "${source}")"
+        [[ "${source}" != /* ]] && source="${dir}/${source}"
+    done
+    dir="$(cd -P "$(dirname "${source}")/.." && pwd)"
+    echo "${dir}/lisp/emacs-query.el"
+}
+
+require_emacs() {
+    command -v "${EMACS:-emacs}" > /dev/null 2>&1 \
+        || die "${EMACS:-emacs} not found in PATH; install Emacs 29.1 or newer"
+}
+
+socket_path() {
+    echo "${TMPDIR:-/tmp}/emacs$(id -u)/${socket_name}"
+}
+
+daemon_running() {
+    [[ -S "$(socket_path)" ]] \
+        && emacsclient -s "${socket_name}" --eval t > /dev/null 2>&1
+}
+
+# A daemon inherits none of our environment, so the payload travels in a file
+# and the report comes back in another.  Scalar options are validated above
+# and are safe to splice into the form.
+run_via_daemon() {
+    local input output status=0 quoted_mode quoted_manual
+    input="$(mktemp)"
+    output="$(mktemp)"
+    printf '%s' "${payload}" > "${input}"
+
+    quoted_mode=$([[ -n "${opt_mode}" ]] && echo "\"${opt_mode}\"" || echo nil)
+    quoted_manual=$([[ -n "${opt_manual}" ]] && echo "\"${opt_manual}\"" || echo nil)
+
+    local form
+    form="$(
+        printf '(emacs-query-serve "%s" "%s" "%s" :mode %s :manual %s' \
+            "${subcommand}" "${input}" "${output}" \
+            "${quoted_mode}" "${quoted_manual}"
+        printf ' :apropos %s :limit %s :config %s)' \
+            "$([[ -n "${opt_apropos}" ]] && echo t || echo nil)" \
+            "${opt_limit}" \
+            "$([[ -n "${opt_config}" ]] && echo "\"${opt_config}\"" || echo nil)"
+    )"
+
+    if ! status="$(emacsclient -s "${socket_name}" --eval "${form}" 2> /dev/null)"; then
+        rm -f "${input}" "${output}"
+        die "daemon query failed; try: emacs-query daemon stop"
+    fi
+    cat "${output}"
+    rm -f "${input}" "${output}"
+    status="${status//[^0-9]/}"
+    return "${status:-1}"
+}
+
+run_via_batch() {
+    local status=0 stderr
+    stderr="$(mktemp)"
+
+    EMACS_QUERY_COMMAND="${subcommand}" \
+        EMACS_QUERY_INPUT="${payload}" \
+        EMACS_QUERY_MODE="${opt_mode}" \
+        EMACS_QUERY_MANUAL="${opt_manual}" \
+        EMACS_QUERY_APROPOS="${opt_apropos}" \
+        EMACS_QUERY_LIMIT="${opt_limit}" \
+        EMACS_QUERY_CONFIG="${opt_config}" \
+        timeout "${opt_timeout}" "${EMACS:-emacs}" -Q --batch \
+        --init-directory="${opt_init_dir}" \
+        --load "$(lisp_file)" \
+        --funcall emacs-query-batch-main 2> "${stderr}" || status=$?
+
+    # Batch Emacs announces every library it loads, and `inhibit-message' does
+    # not reach those.  Drop just that chatter; our own warnings are prefixed
+    # `emacs-query:' and must survive.
+    grep -v '^Loading .*\.\.\.$' "${stderr}" >&2 || true
+    rm -f "${stderr}"
+
+    if [[ "${status}" -eq 124 ]]; then
+        die "timed out after ${opt_timeout}s (raise with --timeout)"
+    fi
+    return "${status}"
+}
+
+daemon_command() {
+    case "${1:-}" in
+        start)
+            if daemon_running; then
+                echo "emacs-query: daemon already running (pid $(daemon_pid))"
+                return 0
+            fi
+            require_emacs
+            # -Q is essential: a plain `--daemon' performs a full startup,
+            # which would run early-init.el and undo every safeguard below.
+            # The config is loaded afterwards, by the hardened bootstrap.
+            "${EMACS:-emacs}" -Q --daemon="${socket_name}" \
+                --init-directory="${opt_init_dir}" > /dev/null 2>&1
+            # Bootstrap once, so every later query skips it.
+            emacsclient -s "${socket_name}" --eval \
+                "(progn (load \"$(lisp_file)\" nil t) \
+                        (emacs-query--bootstrap $([[ -n "${opt_config}" ]] \
+                    && echo t || echo nil)) \
+                        emacs-query-tier)" > /dev/null \
+                || die "daemon started but could not be bootstrapped"
+            echo "emacs-query: daemon started (pid $(daemon_pid)); stop it with" \
+                "'emacs-query daemon stop'"
+            ;;
+        stop)
+            if ! daemon_running; then
+                echo "emacs-query: no daemon running"
+                return 0
+            fi
+            emacsclient -s "${socket_name}" --eval '(kill-emacs)' > /dev/null 2>&1 \
+                || true
+            echo "emacs-query: daemon stopped"
+            ;;
+        status)
+            if daemon_running; then
+                local tier
+                tier="$(emacsclient -s "${socket_name}" --eval \
+                    'emacs-query-tier' 2> /dev/null || echo unknown)"
+                echo "running   pid $(daemon_pid)   tier ${tier}"
+                echo "socket    $(socket_path)"
+            else
+                echo "not running"
+            fi
+            ;;
+        *) die "daemon needs one of: start, stop, status" ;;
+    esac
+}
+
+daemon_pid() {
+    emacsclient -s "${socket_name}" --eval '(emacs-pid)' 2> /dev/null || echo "?"
+}
+
+parse_args() {
+    local -a positional=()
+    while (($# > 0)); do
+        case "$1" in
+            --config) opt_config="yes" ;;
+            --no-config) opt_config="no" ;;
+            --apropos) opt_apropos="1" ;;
+            --mode)
+                opt_mode="${2:-}"
+                shift
+                ;;
+            --manual)
+                opt_manual="${2:-}"
+                shift
+                ;;
+            --limit)
+                opt_limit="${2:-}"
+                shift
+                ;;
+            --timeout)
+                opt_timeout="${2:-}"
+                shift
+                ;;
+            --init-dir)
+                opt_init_dir="${2:-}"
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --version)
+                echo "emacs-query 0.1.0"
+                exit 0
+                ;;
+            -) positional+=("$1") ;;
+            -*) die "unknown option $1 (try --help)" ;;
+            *) positional+=("$1") ;;
+        esac
+        shift
+    done
+
+    [[ ${#positional[@]} -gt 0 ]] || {
+        usage >&2
+        exit 2
+    }
+    subcommand="${positional[0]}"
+    payload="${positional[1]:-}"
+
+    [[ "${opt_limit}" =~ ^[0-9]+$ ]] || die "--limit needs a number"
+    [[ -z "${opt_mode}" || "${opt_mode}" =~ ^[A-Za-z0-9_/-]+$ ]] \
+        || die "--mode needs a mode name"
+    [[ -z "${opt_manual}" || "${opt_manual}" =~ ^[A-Za-z0-9_-]+$ ]] \
+        || die "--manual needs a manual name"
+
+    if [[ -z "${opt_timeout}" ]]; then
+        if [[ "${opt_config}" == "yes" || "${subcommand}" == "keys" ]]; then
+            opt_timeout="${config_timeout}"
+        else
+            opt_timeout="${default_timeout}"
+        fi
+    fi
+    [[ "${opt_timeout}" =~ ^[0-9]+$ ]] || die "--timeout needs a number"
+}
+
+main() {
+    parse_args "$@"
+
+    if [[ "${subcommand}" == "daemon" ]]; then
+        daemon_command "${payload}"
+        return
+    fi
+
+    [[ -n "${payload}" ]] || die "${subcommand} needs an argument (try --help)"
+    [[ "${payload}" == "-" ]] && payload="$(cat)"
+    [[ -n "${payload}" ]] || die "${subcommand} got an empty argument on stdin"
+
+    if daemon_running; then
+        run_via_daemon
+    else
+        require_emacs
+        run_via_batch
+    fi
+}
+
+main "$@"
